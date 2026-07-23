@@ -108,8 +108,18 @@ class AlohaOutputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
         raw_actions = np.asarray(data["actions"])
         
-        # ----------- Action 截断逻辑 (64 -> 56) -----------
-        valid_actions = raw_actions[:, :ACTION_DIM]
+        # 获取当前模型的实际输出维度 (例如 32)
+        current_dim = raw_actions.shape[-1]
+        
+        # ----------- Action 维度补齐/截断逻辑 -----------
+        if current_dim < ACTION_DIM:
+            # 如果模型输出维度小于环境需要的 56 维，则在最后一个维度补零
+            pad_width = ACTION_DIM - current_dim
+            # 注意：raw_actions 的形状通常是 (horizon, action_dim) 比如 (50, 32)
+            valid_actions = np.pad(raw_actions, ((0, 0), (0, pad_width)), mode='constant')
+        else:
+            # 如果模型输出维度大于等于 56 维，则截断
+            valid_actions = raw_actions[..., :ACTION_DIM]
         # --------------------------------------------------
         
         return {"actions": _encode_actions(valid_actions, adapt_to_pi=self.adapt_to_pi)}
