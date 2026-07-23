@@ -7,42 +7,33 @@ import numpy as np
 from openpi import transforms
 
 
-# constants.py
-ARM_DOF = 7          # 改成你的手臂 DOF
-HAND_DOF = 21         # 改成你的单手 DOF（Shadow Hand 常见 20~24）
-ACTION_DIM = 2 * (ARM_DOF + HAND_DOF)   # 双臂双手总维度
+# ================= 核心维度配置 =================
+ARM_DOF = 7          # 单臂自由度
+HAND_DOF = 21        # 单个灵巧手自由度 (21 维适用于常见五指灵巧手)
+ACTION_DIM = 2 * (ARM_DOF + HAND_DOF)  # 外部仿真/硬件环境真实所需的总维度 (56)
+MODEL_BASE_DIM = 64  # pi05_base 预训练时的底层最大预留维度 (通常为 64)
+# ==============================================
 
 
 def make_aloha_example() -> dict:
-    """Creates a random input example for the Aloha policy."""
+    """Creates a random input example for the 56-DOF policy."""
     return {
-        "state": np.ones((ACTION_DIM,)),          # 原来是 (14,)
+        "state": np.ones((ACTION_DIM,)),
         "images": {
             "cam_high": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
             "cam_low": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
             "cam_left_wrist": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
             "cam_right_wrist": np.random.randint(256, size=(3, 224, 224), dtype=np.uint8),
         },
-        "prompt": "do something",
+        "prompt": "grasp the object",
     }
 
 
 @dataclasses.dataclass(frozen=True)
 class AlohaInputs(transforms.DataTransformFn):
-    """Inputs for the Aloha policy.
+    """Inputs wrapper modified for 56-DOF pi05_base mapping."""
 
-    Expected inputs:
-    - images: dict[name, img] where img is [channel, height, width]. name must be in EXPECTED_CAMERAS.
-    - state: [14]
-    - actions: [action_horizon, 14]
-    """
-
-    # If true, this will convert the joint and gripper values from the standard Aloha space to
-    # the space used by the pi internal runtime which was used to train the base model.
     adapt_to_pi: bool = True
-
-    # The expected cameras names. All input cameras must be in this set. Missing cameras will be
-    # replaced with black images and the corresponding `image_mask` will be set to False.
     EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("cam_high", "cam_low", "cam_left_wrist", "cam_right_wrist")
 
     def __call__(self, data: dict) -> dict:
@@ -52,7 +43,6 @@ class AlohaInputs(transforms.DataTransformFn):
         if set(in_images) - set(self.EXPECTED_CAMERAS):
             raise ValueError(f"Expected images to contain {self.EXPECTED_CAMERAS}, got {tuple(in_images)}")
 
-        # Assume that base image always exists.
         base_image = in_images["cam_high"]
 
         images = {
@@ -62,7 +52,6 @@ class AlohaInputs(transforms.DataTransformFn):
             "base_0_rgb": np.True_,
         }
 
-        # Add the extra images.
         extra_image_names = {
             "left_wrist_0_rgb": "cam_left_wrist",
             "right_wrist_0_rgb": "cam_right_wrist",
@@ -75,16 +64,33 @@ class AlohaInputs(transforms.DataTransformFn):
                 images[dest] = np.zeros_like(base_image)
                 image_masks[dest] = np.False_
 
+        # ----------- State 补零逻辑 (56 -> 64) -----------
+        state = np.asarray(data["state"])
+        if state.shape[-1] < MODEL_BASE_DIM:
+            pad_width = MODEL_BASE_DIM - state.shape[-1]
+            state = np.pad(state, (0, pad_width), mode='constant')
+        elif state.shape[-1] > MODEL_BASE_DIM:
+            state = state[..., :MODEL_BASE_DIM]
+        # ------------------------------------------------
+
         inputs = {
             "image": images,
             "image_mask": image_masks,
-            "state": data["state"],
+            "state": state,
         }
 
-        # Actions are only available during training.
         if "actions" in data:
             actions = np.asarray(data["actions"])
             actions = _encode_actions_inv(actions, adapt_to_pi=self.adapt_to_pi)
+            
+            # ----------- Action 补零逻辑 (56 -> 64) -----------
+            if actions.shape[-1] < MODEL_BASE_DIM:
+                pad_width = MODEL_BASE_DIM - actions.shape[-1]
+                actions = np.pad(actions, ((0, 0), (0, pad_width)), mode='constant')
+            elif actions.shape[-1] > MODEL_BASE_DIM:
+                actions = actions[..., :MODEL_BASE_DIM]
+            # --------------------------------------------------
+                
             inputs["actions"] = actions
 
         if "prompt" in data:
@@ -95,35 +101,33 @@ class AlohaInputs(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class AlohaOutputs(transforms.DataTransformFn):
-    """Outputs for the Aloha policy."""
+    """Outputs wrapper modified for 56-DOF pi05_base mapping."""
 
-    # If true, this will convert the joint and gripper values from the standard Aloha space to
-    # the space used by the pi internal runtime which was used to train the base model.
     adapt_to_pi: bool = True
 
     def __call__(self, data: dict) -> dict:
-        # Only return the first 14 dims.
-        actions = np.asarray(data["actions"][:, :ACTION_DIM])
-        return {"actions": _encode_actions(actions, adapt_to_pi=self.adapt_to_pi)}
+        raw_actions = np.asarray(data["actions"])
+        
+        # ----------- Action 截断逻辑 (64 -> 56) -----------
+        valid_actions = raw_actions[:, :ACTION_DIM]
+        # --------------------------------------------------
+        
+        return {"actions": _encode_actions(valid_actions, adapt_to_pi=self.adapt_to_pi)}
 
 
 def _joint_flip_mask() -> np.ndarray:
-    """五指手关节符号表，标定前先全部设为 1（即不翻转）。"""
+    """透传所有自由度，不再反转符号。"""
     return np.ones(ACTION_DIM, dtype=np.float32)
 
 
 def _decode_aloha(data: dict, *, adapt_to_pi: bool = False) -> dict:
-    # state is [left_arm_joint_angles, left_arm_gripper, right_arm_joint_angles, right_arm_gripper]
-    # dim sizes: [6, 1, 6, 1]
     state = np.asarray(data["state"])
     state = _decode_state(state, adapt_to_pi=adapt_to_pi)
 
     def convert_image(img):
         img = np.asarray(img)
-        # Convert to uint8 if using float images.
         if np.issubdtype(img.dtype, np.floating):
             img = (255 * img).astype(np.uint8)
-        # Convert from [channel, height, width] to [height, width, channel].
         return einops.rearrange(img, "c h w -> h w c")
 
     images = data["images"]
@@ -136,15 +140,12 @@ def _decode_aloha(data: dict, *, adapt_to_pi: bool = False) -> dict:
 
 def _decode_state(state: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
     if adapt_to_pi:
-        # Flip the joints.
         state = _joint_flip_mask() * state
-        # Reverse the gripper transformation that is being applied by the Aloha runtime.
     return state
 
 
 def _encode_actions(actions: np.ndarray, *, adapt_to_pi: bool = False) -> np.ndarray:
     if adapt_to_pi:
-        # Flip the joints.
         actions = _joint_flip_mask() * actions
     return actions
 

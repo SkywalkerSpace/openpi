@@ -135,15 +135,34 @@ class Normalize(DataTransformFn):
         )
 
     def _normalize(self, x, stats: NormStats):
-        mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
+        mean, std = stats.mean, stats.std
+        dim = mean.shape[-1]
+        
+        # ======== 新增：如果统计信息维度小于输入维度，仅归一化已知维度 ========
+        if dim < x.shape[-1]:
+            normed_part = (x[..., :dim] - mean) / (std + 1e-6)
+            return np.concatenate([normed_part, x[..., dim:]], axis=-1)
+        # ======================================================================
+            
+        mean = mean[..., : x.shape[-1]]
+        std = std[..., : x.shape[-1]]
         return (x - mean) / (std + 1e-6)
 
     def _normalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
         assert stats.q99 is not None
-        q01, q99 = stats.q01[..., : x.shape[-1]], stats.q99[..., : x.shape[-1]]
+        q01, q99 = stats.q01, stats.q99
+        dim = q01.shape[-1]
+        
+        # ======== 新增：参考 _unnormalize_quantile 增加兼容逻辑[cite: 6] ========
+        if dim < x.shape[-1]:
+            normed_part = (x[..., :dim] - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+            return np.concatenate([normed_part, x[..., dim:]], axis=-1)
+        # ======================================================================
+            
+        q01 = q01[..., : x.shape[-1]]
+        q99 = q99[..., : x.shape[-1]]
         return (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
-
 
 @dataclasses.dataclass(frozen=True)
 class Unnormalize(DataTransformFn):
